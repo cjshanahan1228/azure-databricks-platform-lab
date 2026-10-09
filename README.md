@@ -125,8 +125,15 @@ infra/
   deploy.yml   main / manual: plan, approval, apply
   destroy.yml  manual + nightly destroy
 docs/
+  adr/         ADR-0001 (the approved design) + implementation notes
   learning/    my learning notes per phase
 ```
+
+## Getting started
+
+1. Run the one-time [bootstrap](infra/bootstrap/README.md) locally.
+2. Follow the [phase 1 learning track](docs/learning/phase-1.md): account
+   console and metastore, first deploy, explore, hand-build, then Terraform.
 
 ## Roadmap
 
