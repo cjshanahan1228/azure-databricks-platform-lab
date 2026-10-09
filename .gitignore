@@ -1,0 +1,40 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+*.tfplan.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variable files can hold your email, IDs, etc. Commit only *.example files.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+backend.hcl
+
+# Local bootstrap backend switch (see infra/bootstrap/README.md)
+infra/bootstrap/backend.tf
+
+# Scanners / tooling
+results.sarif
+checkov-results/
+.tflint.d/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python (phase 2)
+__pycache__/
+.venv/
+.pytest_cache/

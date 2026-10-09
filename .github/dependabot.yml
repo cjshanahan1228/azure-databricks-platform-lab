@@ -1,0 +1,23 @@
+# Version + security updates. Actions are SHA-pinned (the repo requires it),
+# so Dependabot is what keeps them current: it rewrites the SHA and the
+# trailing "# vX" comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: "ci" }
+    groups:
+      actions: { patterns: ["*"] }
+
+  # Provider pins + lock files for every Terraform root and module.
+  - package-ecosystem: terraform
+    directories:
+      - /infra/bootstrap
+      - /infra/platform
+      - /infra/workspace
+      - /infra/modules/*
+    schedule: { interval: weekly }
+    commit-message: { prefix: "chore(infra)" }
+    groups:
+      terraform-providers: { patterns: ["*"] }
