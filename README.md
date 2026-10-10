@@ -46,7 +46,7 @@ flowchart LR
     subgraph RGLAB["rg-dbxlab-eus2 (contents are ephemeral)"]
       WS["Databricks workspace<br/>Premium · SCC · VNet-injected"]
       AC["Access connector<br/>managed identity"]
-      ADLS[("ADLS Gen2<br/>public access off · shared key off")]
+      ADLS[("ADLS Gen2<br/>firewalled to access connector · shared key off")]
       NAT["NAT gateway + static IP"]
       subgraph VNET["vnet-dbxlab-eus2"]
         HOST["snet-dbx-host"]
@@ -89,7 +89,8 @@ flowchart LR
 
 The full design, including the trade-offs I didn't build (front-end Private
 Link, IP access lists, Key Vault), is in the
-[design doc](https://github.com/cjshanahan1228/colinshanahan.dev-portfolio/blob/main/docs/design/databricks-platform-lab.md).
+design, [ADR-0001](docs/adr/0001-databricks-platform-lab-design.md), with
+[implementation notes](docs/adr/README.md).
 
 ## Operating model and cost
 
@@ -109,8 +110,14 @@ design doc for the line items):
 | Budget alert cap | **$25 / month** (50 %, 80 %, 100 % actual, 100 % forecast) |
 
 The biggest standing cost is the NAT gateway (~$0.045/h), which is why the lab
-isn't left running. Measured deploy and destroy times will be recorded here in
-phase 1.
+isn't left running. Measured deploy and destroy times (from the Deploy and
+Destroy job summaries) will be recorded here after the first deploy:
+
+| Measured | Time |
+|---|---|
+| Platform apply | _TBD_ |
+| Workspace (UC) apply | _TBD_ |
+| Destroy (workspace + platform) | _TBD_ |
 
 ## Repository layout
 
@@ -122,11 +129,27 @@ infra/
   modules/     network, lakehouse-storage, databricks-workspace, unity-catalog
 .github/workflows/
   ci.yml       pull requests: fmt, validate, TFLint, Checkov, plan
-  deploy.yml   main / manual: plan, approval, apply
-  destroy.yml  manual + nightly destroy
+  deploy.yml   main / manual: plan, approval, apply (+ metastore and orphan checks)
+  destroy.yml  manual + nightly destroy (cancels unapproved deploys first)
+  codeql.yml   CodeQL for the workflows
+.github/scripts/
+  plan-summary.sh, write-platform-tfvars.sh, databricks-checks.sh, wait-managed-rg.sh
 docs/
+  adr/         ADR-0001 (the approved design) + implementation notes
   learning/    my learning notes per phase
+  runbooks/    orphaned Unity Catalog objects, deploy/destroy concurrency
 ```
+
+**Reviews and merging.** `CODEOWNERS` routes review requests to me, but
+`main` has no branch protection or ruleset requiring code-owner review, so I
+can merge my own PRs. If required checks are added later, leave
+"Require review from Code Owners" off.
+
+## Getting started
+
+1. Run the one-time [bootstrap](infra/bootstrap/README.md) locally.
+2. Follow the [phase 1 learning track](docs/learning/phase-1.md): account
+   console and metastore, first deploy, explore, hand-build, then Terraform.
 
 ## Roadmap
 

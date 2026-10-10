@@ -1,0 +1,22 @@
+{
+  "num_workers": { "type": "fixed", "value": 0, "hidden": true },
+  "spark_conf.spark.databricks.cluster.profile": { "type": "fixed", "value": "singleNode", "hidden": true },
+  "spark_conf.spark.master": { "type": "fixed", "value": "local[*,4]", "hidden": true },
+  "custom_tags.ResourceClass": { "type": "fixed", "value": "SingleNode", "hidden": true },
+
+  "node_type_id": { "type": "allowlist", "values": ${node_types}, "defaultValue": ${default_node_type} },
+  "driver_node_type_id": { "type": "allowlist", "values": ${node_types}, "defaultValue": ${default_node_type}, "hidden": true },
+
+  "autotermination_minutes": { "type": "fixed", "value": ${autotermination_minutes} },
+  "dbus_per_hour": { "type": "range", "maxValue": 1 },
+
+  "data_security_mode": { "type": "fixed", "value": "SINGLE_USER" },
+  "runtime_engine": { "type": "fixed", "value": "STANDARD", "hidden": true },
+  "azure_attributes.availability": { "type": "fixed", "value": "ON_DEMAND_AZURE", "hidden": true },
+
+  "custom_tags.project": { "type": "fixed", "value": "databricks-platform-lab" },
+  "custom_tags.owner": { "type": "fixed", "value": "colin" },
+  "custom_tags.env": { "type": "fixed", "value": "lab" },
+  "custom_tags.lifecycle": { "type": "fixed", "value": "ephemeral" },
+  "custom_tags.managed_by": { "type": "fixed", "value": "terraform" }
+}

@@ -38,3 +38,4 @@ checkov-results/
 __pycache__/
 .venv/
 .pytest_cache/
+.checkov-gha/

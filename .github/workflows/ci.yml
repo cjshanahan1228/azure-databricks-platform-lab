@@ -1,0 +1,202 @@
+# CI for every pull request (and main, to keep the code-scanning baseline).
+#
+#   static   terraform fmt / init -backend=false / validate for all three
+#            roots, then TFLint (azurerm ruleset). No Azure access.
+#   checkov  Checkov over infra/ and the workflows; SARIF to code scanning.
+#   plan     terraform plan of the PLATFORM stack as the read-only
+#            id-gh-dbxlab-plan identity (OIDC subject ...:pull_request), with a
+#            redacted summary posted on the PR. Skipped (not failed) until
+#            Colin has run bootstrap and set the repo variables, and always
+#            skipped for fork PRs (no OIDC token, no write token).
+#
+# The WORKSPACE stack isn't planned here: its provider needs a running
+# workspace, and the plan identity isn't a workspace user. It is planned and
+# applied in deploy.yml after the platform apply (design deviation, see PR).
+#
+# Public repo: no secrets exist, and GUIDs are redacted from plan output.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.16.5"
+  TFLINT_VERSION: "v0.64.0"
+  CHECKOV_VERSION: "3.3.26"
+
+jobs:
+  static:
+    name: Terraform (fmt, validate, TFLint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff infra
+
+      - name: terraform validate (bootstrap, platform, workspace)
+        run: |
+          for d in bootstrap platform workspace; do
+            echo "::group::$d"
+            terraform -chdir="infra/$d" init -backend=false -lockfile=readonly -no-color
+            terraform -chdir="infra/$d" validate -no-color
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: TFLint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # plugin download rate limit only
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" -f compact
+
+      - name: Azure configuration
+        env:
+          PLAN_ID: ${{ vars.AZURE_CLIENT_ID_PLAN }}
+          STATE: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+        run: |
+          if [ -z "$PLAN_ID" ] || [ -z "$STATE" ]; then
+            echo "::notice title=Plan skipped::Azure repo variables aren't set yet, so the plan job is skipped. Run infra/bootstrap first (see infra/bootstrap/README.md)."
+          fi
+
+  checkov:
+    name: Checkov (IaC + workflows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload SARIF
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Checkov
+        run: python -m pip install --disable-pip-version-check --quiet "checkov==${CHECKOV_VERSION}"
+
+      - name: Checkov
+        id: checkov
+        # Checkov's workflow schema doesn't know GitHub's `concurrency.queue`
+        # key yet and silently SKIPS files that use it, so scan a copy of the
+        # workflows with only that line removed (nothing else changes).
+        run: |
+          set +e
+          mkdir -p .checkov-gha/.github/workflows
+          for f in .github/workflows/*.yml; do
+            sed '/^ *queue: max$/d' "$f" > ".checkov-gha/$f"
+          done
+          checkov --directory infra --directory .checkov-gha --framework terraform github_actions \
+            --output cli --output sarif --output-file-path console,results.sarif \
+            --compact --quiet
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: results.sarif
+          category: checkov
+
+      - name: Fail on findings
+        if: steps.checkov.outputs.exit_code != '0'
+        run: |
+          echo "::error::Checkov found failing checks. Fix them, or add an inline #checkov:skip=<ID>:<justification>."
+          exit 1
+
+  plan:
+    name: Plan (platform)
+    needs: static
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.AZURE_CLIENT_ID_PLAN != '' && vars.AZURE_TENANT_ID != '' &&
+      vars.AZURE_SUBSCRIPTION_ID != '' && vars.TFSTATE_STORAGE_ACCOUNT != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write      # OIDC -> id-gh-dbxlab-plan
+      pull-requests: write # plan comment
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_PLAN }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+    steps:
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+          echo "::add-mask::$ARM_CLIENT_ID"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform -chdir=infra/platform init -lockfile=readonly -no-color \
+            -backend-config="resource_group_name=rg-dbxlab-state" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=tfstate"
+
+      - name: terraform plan
+        run: terraform -chdir=infra/platform plan -lock-timeout=5m -no-color -out=tfplan > /dev/null
+
+      - name: Summarize plan
+        run: |
+          .github/scripts/plan-summary.sh infra/platform tfplan "Terraform plan: platform" > /dev/null
+
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          marker='<!-- tf-plan:platform -->'
+          { echo "$marker"; cat plan-summary.md; echo; echo "_Plan identity, run [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID})._"; } > body.md
+          id=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+                 --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md > /dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" -F body=@body.md > /dev/null
+          fi

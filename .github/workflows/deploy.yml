@@ -1,0 +1,230 @@
+# Deploy the lab: platform stack, then (once enabled) the workspace stack.
+#
+#   plan   read-only id-gh-dbxlab-plan (OIDC subject ...:ref:refs/heads/main).
+#          Plans `platform` and publishes a redacted summary plus a change
+#          digest. The plan FILE is not uploaded: artifacts on a public repo
+#          are downloadable, and it contains resource IDs.
+#   apply  environment `lab` (required reviewer: Colin; main only) ->
+#          id-gh-dbxlab-apply. Re-plans, refuses to continue if the change set
+#          differs from the one you approved (digest mismatch), applies that
+#          plan, then plans + applies `workspace` if DEPLOY_WORKSPACE_STACK is
+#          "true". Records how long each step took (phase 1 acceptance).
+#
+# Ephemeral by default: destroy.yml tears everything down nightly unless
+# LAB_KEEP_ALIVE_UNTIL is set. Deploying costs money (≈ $0.07/h standing for
+# NAT, IP and private endpoints, plus any clusters you start). Rejecting the
+# approval costs nothing.
+#
+# Repo variables: AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_CLIENT_ID_PLAN,
+# AZURE_CLIENT_ID_APPLY, TFSTATE_STORAGE_ACCOUNT (from bootstrap), LAB_ADMIN
+# (your Databricks user), DEPLOY_WORKSPACE_STACK ("true" once the metastore
+# grants are in place).
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/platform/**"
+      - "infra/workspace/**"
+      - "infra/modules/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No workflow-level concurrency: the lock is on the APPLY job only (below), so
+# a deploy that is merely planned or waiting for approval doesn't hold the
+# `lab-env` group. destroy.yml also cancels any deploy run that is waiting for
+# approval or queued before it destroys (see docs/runbooks/deploy-destroy-concurrency.md).
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.16.5"
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+
+jobs:
+  plan:
+    name: Plan (platform)
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.AZURE_CLIENT_ID_PLAN != '' && vars.AZURE_CLIENT_ID_APPLY != '' &&
+      vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' &&
+      vars.TFSTATE_STORAGE_ACCOUNT != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # OIDC -> id-gh-dbxlab-plan
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_PLAN }}
+    outputs:
+      digest: ${{ steps.summary.outputs.digest }}
+    steps:
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+          echo "::add-mask::$ARM_CLIENT_ID"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform -chdir=infra/platform init -lockfile=readonly -no-color \
+            -backend-config="resource_group_name=rg-dbxlab-state" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=tfstate"
+
+      - name: terraform plan
+        run: terraform -chdir=infra/platform plan -lock-timeout=5m -no-color -out=tfplan > /dev/null
+
+      - name: Summarize plan
+        id: summary
+        run: |
+          digest=$(.github/scripts/plan-summary.sh infra/platform tfplan "Terraform plan: platform (approve the 'lab' environment to apply exactly this)")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  apply:
+    name: Apply (platform -> workspace)
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: lab
+    # Shared with destroy.yml. Never cancel an in-flight apply; `queue: max`
+    # stops a newer queued run from replacing (cancelling) an older pending one,
+    # e.g. a pending nightly destroy (GitHub's default keeps only one pending).
+    concurrency:
+      group: lab-env
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write # OIDC -> id-gh-dbxlab-apply
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_APPLY }}
+      DATABRICKS_AUTH_TYPE: github-oidc-azure
+      TF_VAR_lab_admin: ${{ vars.LAB_ADMIN }}
+      DEPLOY_WORKSPACE_STACK: ${{ vars.DEPLOY_WORKSPACE_STACK }}
+      APPROVED_DIGEST: ${{ needs.plan.outputs.digest }}
+    steps:
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+          echo "::add-mask::$ARM_CLIENT_ID"
+          if [ -n "$TF_VAR_lab_admin" ]; then echo "::add-mask::$TF_VAR_lab_admin"; fi
+          echo "started=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # Azure CLI session for the pre/post checks below (Terraform itself uses
+      # ARM_USE_OIDC directly).
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_APPLY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform init (platform)
+        run: |
+          terraform -chdir=infra/platform init -lockfile=readonly -no-color \
+            -backend-config="resource_group_name=rg-dbxlab-state" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=tfstate"
+
+      - name: Re-plan and compare with the approved plan
+        run: |
+          terraform -chdir=infra/platform plan -lock-timeout=5m -no-color -out=tfplan > /dev/null
+          digest=$(GITHUB_STEP_SUMMARY=/dev/null .github/scripts/plan-summary.sh infra/platform tfplan "platform")
+          if [ "$digest" != "$APPROVED_DIGEST" ]; then
+            echo "::error::The platform change set differs from the plan you approved (something changed in Azure or state in between). Nothing was applied. Re-run the workflow and review the new plan."
+            exit 1
+          fi
+          echo "Change set matches the approved plan (${digest:0:16})."
+
+      - name: Wait for the previous managed RG to finish deleting
+        env:
+          WAIT_MINUTES: "30"
+        run: .github/scripts/wait-managed-rg.sh
+
+      - name: terraform apply (platform)
+        run: |
+          t0=$(date +%s)
+          terraform -chdir=infra/platform apply -lock-timeout=5m -no-color tfplan > apply.log 2>&1 || { tail -n 60 apply.log; exit 1; }
+          grep -E '^Apply complete' apply.log || true
+          echo "platform_seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+
+      # Phase 1 acceptance check: the brand-new workspace must be attached to
+      # the East US 2 metastore via auto-assignment (the apply identity isn't
+      # an account admin and can't assign it).
+      - name: Check metastore assignment
+        run: .github/scripts/databricks-checks.sh metastore
+
+      - name: Workspace stack
+        id: ws
+        run: |
+          if [ "$DEPLOY_WORKSPACE_STACK" != "true" ]; then
+            echo "::notice title=Workspace stack skipped::DEPLOY_WORKSPACE_STACK isn't \"true\". Finish the metastore steps in docs/learning/phase-1.md, then set it."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$TF_VAR_lab_admin" ]; then
+            echo "::error::Set the LAB_ADMIN repo variable (your Databricks user) before enabling the workspace stack."
+            exit 1
+          fi
+          .github/scripts/write-platform-tfvars.sh
+          t0=$(date +%s)
+          terraform -chdir=infra/workspace init -lockfile=readonly -no-color \
+            -backend-config="resource_group_name=rg-dbxlab-state" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=tfstate"
+          .github/scripts/databricks-checks.sh orphan-catalog
+          terraform -chdir=infra/workspace plan -lock-timeout=5m -no-color -out=tfplan > /dev/null
+          .github/scripts/plan-summary.sh infra/workspace tfplan "Terraform plan: workspace (applied in this run)" > /dev/null
+          terraform -chdir=infra/workspace apply -lock-timeout=5m -no-color tfplan > apply.log 2>&1 || { tail -n 60 apply.log; exit 1; }
+          grep -E '^Apply complete' apply.log || true
+          echo "workspace_seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record timings
+        if: always()
+        run: |
+          fmt() { [ -n "${1:-}" ] && printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )) || echo "n/a"; }
+          {
+            echo "### Deploy timings"
+            echo
+            echo "| Step | Duration |"
+            echo "|---|---|"
+            echo "| platform apply | $(fmt "${platform_seconds:-}") |"
+            echo "| workspace apply | $(fmt "${workspace_seconds:-}") |"
+            echo "| whole job (after approval) | $(fmt "$(( $(date +%s) - started ))") |"
+            echo
+            echo "Workspace URL: open \`dbw-dbxlab-eus2\` in the Azure portal (it changes on every deploy and isn't printed in this public log)."
+            echo
+            echo "**Remember:** this costs money while it's up. destroy.yml runs nightly unless LAB_KEEP_ALIVE_UNTIL is set."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Also as an annotation, so the times show on the run page without
+          # opening the summary. Durations only; nothing identifying.
+          echo "::notice title=Deploy timings::platform apply $(fmt "${platform_seconds:-}"), workspace apply $(fmt "${workspace_seconds:-}"), job $(fmt "$(( $(date +%s) - started ))")"
