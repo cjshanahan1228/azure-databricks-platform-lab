@@ -4,6 +4,16 @@ variable "prefix" {
   default     = "dbxlab"
 }
 
+variable "name_suffix" {
+  description = "Per-deploy suffix for the storage credential and external location names."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9]{4,8}$", var.name_suffix))
+    error_message = "name_suffix must be 4-8 lowercase letters/digits."
+  }
+}
+
 variable "access_connector_id" {
   type = string
 }

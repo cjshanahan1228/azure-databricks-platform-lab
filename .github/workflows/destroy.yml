@@ -36,9 +36,8 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: lab-env
-  cancel-in-progress: false
+# Concurrency is on the destroy JOB (below), not the workflow, so `decide` and
+# `cancel-pending-deploys` can run while a deploy holds the lock.
 
 env:
   TF_IN_AUTOMATION: "true"
@@ -87,13 +86,52 @@ jobs:
           fi
           echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
 
+  # A deploy that nobody approved would otherwise sit in the `lab-env` group
+  # (its apply job waits on the `lab` reviewer for up to 30 days) and block
+  # the safety net. Cancel deploy runs that are waiting for approval or
+  # queued. A deploy that is actually applying is left alone; the destroy job
+  # queues behind it and runs when it finishes.
+  cancel-pending-deploys:
+    name: Cancel unapproved/queued deploys
+    needs: decide
+    if: needs.decide.outputs.proceed == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # cancel workflow runs; this job only
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Cancel waiting / queued / pending deploy runs
+        run: |
+          ids=$(for s in waiting queued pending requested; do
+                  gh run list --workflow deploy.yml --status "$s" --limit 50 --json databaseId --jq '.[].databaseId'
+                done | sort -u)
+          if [ -z "$ids" ]; then
+            echo "No waiting or queued deploy runs."
+            exit 0
+          fi
+          for id in $ids; do
+            echo "Cancelling deploy run $id"
+            gh run cancel "$id" || echo "::warning::Couldn't cancel run $id (it may have just finished)."
+          done
+          echo "### Cancelled unapproved/queued deploy runs: $(echo "$ids" | wc -w)" >> "$GITHUB_STEP_SUMMARY"
+
   destroy:
     name: Destroy (workspace -> platform)
-    needs: decide
+    needs: [decide, cancel-pending-deploys]
     if: needs.decide.outputs.proceed == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: lab-destroy
+    # Shared with deploy.yml's apply job. A pending destroy is never cancelled
+    # by a newer run (queue: max), and an in-flight destroy is never cancelled
+    # (cancel-in-progress: false).
+    concurrency:
+      group: lab-env
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write # OIDC -> id-gh-dbxlab-apply
@@ -197,3 +235,4 @@ jobs:
             echo "| platform destroy | $(fmt "${platform_seconds:-}") |"
             echo "| whole job | $(fmt "$(( $(date +%s) - started ))") |"
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Destroy timings::workspace destroy $(fmt "${workspace_seconds:-}"), platform destroy $(fmt "${platform_seconds:-}"), job $(fmt "$(( $(date +%s) - started ))")"

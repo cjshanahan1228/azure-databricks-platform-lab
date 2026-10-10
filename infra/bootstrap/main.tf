@@ -226,6 +226,31 @@ resource "azurerm_role_assignment" "apply_contributor_subscription" {
   description          = "Fallback: subscription Contributor because RG-scoped Contributor couldn't create the Databricks managed RG."
 }
 
+# Deploy waits for the previous deploy's Databricks-managed RG to finish
+# deleting before it re-creates a workspace with the same fixed managed RG
+# name. Seeing that RG (outside the lab RG) needs resource-group READ at
+# subscription scope; this custom role grants exactly that one action, so
+# the identity can see RG names/states but nothing inside them.
+resource "azurerm_role_definition" "rg_metadata_reader" {
+  name        = "dbxlab resource group metadata reader"
+  scope       = data.azurerm_subscription.current.id
+  description = "Read resource group metadata (name, provisioning state) only. Used by the lab's deploy pre-check."
+
+  permissions {
+    actions = ["Microsoft.Resources/subscriptions/resourceGroups/read"]
+  }
+
+  assignable_scopes = [data.azurerm_subscription.current.id]
+}
+
+resource "azurerm_role_assignment" "apply_rg_metadata_reader" {
+  scope              = data.azurerm_subscription.current.id
+  role_definition_id = azurerm_role_definition.rg_metadata_reader.role_definition_resource_id
+  principal_id       = azurerm_user_assigned_identity.apply.principal_id
+  principal_type     = "ServicePrincipal"
+  description        = "CI apply: wait for rg-dbxlab-eus2-managed to finish deleting before redeploying."
+}
+
 resource "azurerm_role_assignment" "apply_state_blob" {
   scope                = azurerm_storage_container.tfstate.id
   role_definition_name = "Storage Blob Data Contributor"

@@ -1,4 +1,4 @@
-# ADLS Gen2 for the lakehouse: no public network access, no shared keys,
+# ADLS Gen2 for the lakehouse: firewalled to the access connector, no shared keys,
 # reached by clusters through private endpoints (dfs + blob) and by Unity
 # Catalog through the access connector's managed identity.
 
@@ -29,7 +29,7 @@ resource "azurerm_storage_account" "this" {
   #checkov:skip=CKV2_AZURE_1:Customer-managed keys are out of scope (design §2).
   #checkov:skip=CKV2_AZURE_21:Storage read logging would cost more than the lab's data; UC audit logs cover data access.
   #checkov:skip=CKV_AZURE_33:Queue service is unused.
-  #checkov:skip=CKV_AZURE_59:False positive: public access IS disabled via public_network_access = "Disabled" (azurerm 5 replacement for the deprecated public_network_access_enabled that this check reads).
+  #checkov:skip=CKV_AZURE_59:Public endpoint is "Enabled from selected networks" only: default_action Deny, no IP/VNet rules, no trusted-services bypass; the single resource-instance rule admits the lab's access connector (Unity Catalog). Clusters use private endpoints.
   #checkov:skip=CKV_AZURE_36:Deliberate: no blanket trusted-services bypass. Only the lab's access connector is allowed, via a resource-instance rule (Databricks' recommended pattern).
   name                = "stdbxlab${random_string.suffix.result}"
   resource_group_name = var.resource_group_name
@@ -53,12 +53,14 @@ resource "azurerm_storage_account" "this" {
   cross_tenant_replication_enabled  = false
   infrastructure_encryption_enabled = true
 
-  # No public network access at all. Clusters use the private endpoints.
-  # Unity Catalog (control plane) reaches it through the access connector's
-  # managed identity, which can bypass this check via the resource-instance
-  # rule below (Microsoft Learn: "Configure trusted access to Azure Storage
-  # based on your managed identity").
-  public_network_access = "Disabled"
+  # Firewalled to the access connector (Databricks' documented "standard
+  # approach" for UC with a storage firewall): the public endpoint is enabled
+  # only for selected networks, the default action is Deny, there are no IP
+  # or VNet rules and no trusted-services bypass, and one resource-instance
+  # rule admits the lab's access connector so the Unity Catalog control plane
+  # can validate the credential/location and vend credentials. Clusters
+  # (compute plane) reach the account through the private endpoints below.
+  public_network_access = "Enabled"
 
   network_rules {
     default_action = "Deny"
@@ -87,7 +89,7 @@ resource "azurerm_storage_account" "this" {
 }
 
 # Through the ARM management plane, so the GitHub runner never needs
-# data-plane network access to an account with public access off.
+# data-plane network access to a firewalled account.
 # tflint-ignore: azurerm_resources_missing_prevent_destroy # ephemeral by design: destroyed nightly
 resource "azurerm_storage_container" "lakehouse" {
   #checkov:skip=CKV2_AZURE_21:Storage read logging would cost more than the lab's data; UC audit logs cover data access.

@@ -37,7 +37,7 @@ provider "azurerm" {
   features {
     storage {
       # Don't make data-plane calls to storage accounts. The lakehouse account
-      # has public network access disabled, and GitHub-hosted runners aren't
+      # is firewalled (default Deny), and GitHub-hosted runners aren't
       # in the VNet, so data-plane reads would fail during plan.
       data_plane_available = false
     }

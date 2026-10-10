@@ -6,9 +6,18 @@
 # account console; see docs/learning/phase-1.md).
 data "databricks_current_metastore" "this" {}
 
+# New on every deploy (this state is destroyed with the lab), so the UC
+# credential and location names never repeat between deploys.
+resource "random_string" "uc_suffix" {
+  length  = 4
+  upper   = false
+  special = false
+}
+
 module "unity_catalog" {
   source = "../modules/unity-catalog"
 
+  name_suffix         = random_string.uc_suffix.result
   access_connector_id = var.access_connector_id
   lakehouse_url       = var.lakehouse_url
   lab_admin           = var.lab_admin

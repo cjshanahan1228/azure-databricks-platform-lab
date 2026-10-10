@@ -7,7 +7,7 @@ This stack is the persistent foundation that CI can't create for itself:
 | `rg-dbxlab-state` + `stdbxlabtf<4 chars>` / container `tfstate` | Remote state for every stack. Shared keys **disabled**, Entra ID only, blob versioning + 30-day soft delete, `prevent_destroy`. |
 | `rg-dbxlab-eus2` (empty) | The lab RG. Persistent so the CI roles and budget survive every nightly destroy; `platform` fills and empties it. |
 | `id-gh-dbxlab-plan` | Read-only CI identity. Federated to `pull_request` and `ref:refs/heads/main`. Reader on the lab RG + Storage Blob Data Contributor on the state container (state locking is a blob lease, which is a write). |
-| `id-gh-dbxlab-apply` | Deploy/destroy CI identity. Federated to the `lab` and `lab-destroy` GitHub environments only. Contributor on the lab RG, Storage Blob Data Contributor on the state container, and **Role Based Access Control Administrator conditioned to Storage Blob Data Contributor + Cognitive Services OpenAI User only**. |
+| `id-gh-dbxlab-apply` | Deploy/destroy CI identity. Federated to the `lab` and `lab-destroy` GitHub environments only. Contributor on the lab RG, Storage Blob Data Contributor on the state container, and **Role Based Access Control Administrator conditioned to Storage Blob Data Contributor + Cognitive Services OpenAI User only**, plus a custom role with only `resourceGroups/read` at subscription scope (to wait for the previous managed RG to finish deleting). |
 | `budget-dbxlab-monthly` | $25/month, filtered to the lab RG, the Databricks managed RG and the state RG. Emails at 50 %, 80 %, 100 % actual and 100 % forecast. |
 | Resource provider registrations | Microsoft.Databricks and friends, so the CI identities never need subscription-level rights. |
 
@@ -42,7 +42,7 @@ subscription.
    terraform plan -out=bootstrap.tfplan
    ```
 
-   Expect 18 resources to add and nothing to change or destroy. Things
+   Expect 20 resources to add and nothing to change or destroy. Things
    worth reading closely (each is an interview talking point):
    - the four `azurerm_federated_identity_credential` subjects: which GitHub
      contexts can become which identity;
@@ -102,6 +102,14 @@ subscription.
    terraform output apply_client_id        # application ID of id-gh-dbxlab-apply
    terraform output apply_principal_name
    ```
+
+8. **Prerequisite before the first deploy: metastore auto-assignment.** In
+   the Databricks account console (you're account admin as Global Admin), make
+   sure an East US 2 metastore exists and **auto-assignment of new eastus2
+   workspaces is enabled** (metastore → Configuration → Workspace assignment).
+   The workspace is new on every deploy and the CI identity isn't an account
+   admin, so there is no other unattended way to attach it. Deploy verifies
+   this and fails if it's missing. Details: learning doc Step 2.
 
 Then continue with **Step 2** in [docs/learning/phase-1.md](../../docs/learning/phase-1.md#your-hands-on-steps-in-order).
 

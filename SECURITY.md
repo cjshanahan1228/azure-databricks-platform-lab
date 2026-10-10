@@ -38,7 +38,8 @@ service.
   Contributor and Cognitive Services OpenAI User (an ABAC-conditioned Role
   Based Access Control Administrator assignment).
 - **Shared keys are disabled** on both storage accounts (Terraform state and
-  the lakehouse). Access is Entra ID only. The lakehouse account has public
-  network access disabled and is reached through private endpoints.
+  the lakehouse). Access is Entra ID only. The lakehouse account is
+  firewalled to the lab's access connector (default Deny, no IP/VNet rules, no
+  trusted-services bypass); clusters reach it through private endpoints.
 - Actions are pinned to full commit SHAs and the repository enforces it.
   Workflow logs are public, so subscription and tenant IDs are masked.

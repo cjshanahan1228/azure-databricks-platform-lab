@@ -79,7 +79,7 @@ Not covered, and intentionally out of scope: hub-and-spoke landing zones, Azure 
 **In scope (phase 1, the platform):**
 - An Azure Databricks **Premium** workspace. Premium isn't optional. Azure stopped allowing new Standard-tier workspaces on April 1, 2026, and Unity Catalog, serverless, IP access lists, and Private Link all require Premium anyway.
 - VNet injection with secure cluster connectivity (no public IPs on cluster nodes), a NAT gateway for egress, and private endpoints plus private DNS for the lakehouse storage account.
-- An ADLS Gen2 account with public network access off and shared-key auth off, reached through a Unity Catalog access connector.
+- An ADLS Gen2 account firewalled to the access connector (default Deny, no IP/VNet rules, no trusted-services bypass) with shared-key auth off, reached by clusters through private endpoints and by Unity Catalog through the access connector. *(Amended 2026-10-10, see [implementation notes](README.md).)*
 - Unity Catalog objects: storage credential, external location, a lab catalog with bronze/silver/gold schemas, grants, and a cluster policy.
 - GitHub Actions: plan on PR, gated apply, destroy (manual and scheduled), and IaC scanning.
 - Budgets, tags, and auto-termination.
@@ -115,7 +115,7 @@ flowchart LR
     subgraph RGLAB["rg-dbxlab-eus2 (contents are ephemeral)"]
       WS["Databricks workspace<br/>Premium · SCC · VNet-injected"]
       AC["Access connector<br/>system-assigned MI"]
-      ADLS[("ADLS Gen2<br/>public access off · shared key off")]
+      ADLS[("ADLS Gen2<br/>firewalled to access connector · shared key off")]
       DNS["Private DNS zones<br/>privatelink.dfs / .blob"]
       NAT["NAT gateway + static public IP"]
       LAW["Log Analytics<br/>workspace diagnostics"]
@@ -171,7 +171,7 @@ flowchart LR
 | Databricks subnets | `snet-dbx-host` `10.60.0.0/25` and `snet-dbx-container` `10.60.0.128/25`, both delegated to `Microsoft.Databricks/workspaces` and each with an NSG. Databricks requires at least /26. /25 leaves headroom. |
 | Private endpoint subnet | `snet-pep` `10.60.1.0/27` |
 | Egress | NAT gateway with one static public IP on both Databricks subnets. This is required, not optional: with SCC the nodes have no public IPs, and new VNets created on current API versions get private subnets with no default outbound access (Microsoft retired default outbound access for new VNets). |
-| Storage | ADLS Gen2 with `public_network_access_enabled = false`, private endpoints for `dfs` (required) and `blob` (recommended), private DNS zones `privatelink.dfs.core.windows.net` and `privatelink.blob.core.windows.net` linked to the VNet, and a resource-instance rule allowing the access connector |
+| Storage | ADLS Gen2 firewalled to the access connector (`public_network_access = "Enabled"` from selected networks only, `default_action = "Deny"`, `bypass = ["None"]`, no IP/VNet rules; amended 2026-10-10), private endpoints for `dfs` (required) and `blob` (recommended), private DNS zones `privatelink.dfs.core.windows.net` and `privatelink.blob.core.windows.net` linked to the VNet, and a resource-instance rule allowing the access connector |
 | Service endpoints | Not needed. Note that Azure's new "standard service endpoint" (preview) has a planned per-VNet hourly charge, so don't confuse it with classic service endpoints. |
 
 ### The trade-off: VNet injection only vs adding Private Link
@@ -188,7 +188,7 @@ Azure Databricks has three independent network controls, and "private" can mean 
 
 **What about IP access lists?** These are a Premium feature that would restrict the public front end to Colin's IP. They're not recommended for phase 1, because they also block GitHub-hosted runners (dynamic IPs), so the Databricks provider and bundle deploys would fail. The front door is Entra ID with MFA. With public data only, that's an acceptable lab posture, and the doc says so plainly.
 
-**Serverless note:** serverless compute runs in Databricks' account, not our VNet. To reach an ADLS account with public access off, it needs a network connectivity configuration (NCC) with private endpoint rules. The cost of serverless private connectivity is **TBD** (no rate found). Phases 1–2 use classic job compute. Serverless is an optional experiment.
+**Serverless note:** serverless compute runs in Databricks' account, not our VNet. To reach a firewalled ADLS account, it needs a network connectivity configuration (NCC) with private endpoint rules. The cost of serverless private connectivity is **TBD** (no rate found). Phases 1–2 use classic job compute. Serverless is an optional experiment.
 
 ## 5. Identity and secrets
 
@@ -210,7 +210,7 @@ Azure Databricks has three independent network controls, and "private" can mean 
 
 **One-time manual identity steps (Colin, by design):**
 1. Apply the `bootstrap` stack locally with his own `az login`. It creates the state account, both managed identities, the federated credentials, role assignments, and budgets. CI can't create its own identity.
-2. Sign in to the Databricks **account console**. If the account has no account admin yet, the first one must be an Entra Global Administrator when they first sign in. If admins already exist, one of them can add Colin. Confirm whether a Unity Catalog metastore already exists in East US 2 (one is allowed per region per account; accounts created after Nov 9, 2023 get one automatically). Either turn on auto-assignment of new workspaces to it, or grant the CI identity what it needs. Then grant the apply identity `CREATE CATALOG`, `CREATE STORAGE CREDENTIAL`, and `CREATE EXTERNAL LOCATION` on the metastore rather than making it an account admin.
+2. Sign in to the Databricks **account console**. If the account has no account admin yet, the first one must be an Entra Global Administrator when they first sign in. If admins already exist, one of them can add Colin. Confirm whether a Unity Catalog metastore already exists in East US 2 (one is allowed per region per account; accounts created after Nov 9, 2023 get one automatically). **Turn on auto-assignment of new East US 2 workspaces to it.** This is a hard prerequisite: the workspace is new on every deploy and the CI identity isn't an account admin, so it can't assign a metastore itself (amended 2026-10-10). Then grant the apply identity `CREATE CATALOG`, `CREATE STORAGE CREDENTIAL`, and `CREATE EXTERNAL LOCATION` on the metastore rather than making it an account admin.
 
 ## 6. Terraform layout
 
@@ -225,7 +225,7 @@ azure-databricks-platform-lab/
 │   ├── platform/             # azurerm, ephemeral: VNet, NSGs, NAT, PIP, private endpoints, DNS,
 │   │                         #   ADLS, access connector, workspace, diagnostics → Log Analytics
 │   ├── workspace/            # databricks provider, ephemeral: storage credential, external location,
-│   │                         #   catalog/schemas, grants, cluster policy, (metastore assignment if needed)
+│   │                         #   catalog/schemas, grants, cluster policy (metastore assignment comes from auto-assignment)
 │   └── modules/
 │       ├── network/          # vnet, delegated subnets, nsgs, nat, optional back-end PL
 │       ├── lakehouse-storage/# adls + private endpoints + dns
@@ -239,7 +239,7 @@ azure-databricks-platform-lab/
 **Why `platform` and `workspace` are separate roots:** the databricks provider is configured from the workspace's outputs. Configuring a provider from a resource created in the same state is a known Terraform anti-pattern that breaks plans when the workspace doesn't exist yet and breaks destroys in the wrong order. With two roots, `destroy` runs `workspace` first, which removes UC objects cleanly and leaves no orphaned external locations in the long-lived metastore, then `platform`.
 
 **Providers:**
-- `hashicorp/azurerm ~> 5.7`, matching the portfolio (lock file currently 5.8.0). Set `storage_use_azuread = true` because shared keys are disabled. Create containers with `storage_account_id` so they go through the ARM management plane, and the runner never needs data-plane network access to a storage account with public access off.
+- `hashicorp/azurerm ~> 5.7`, matching the portfolio (lock file currently 5.8.0). Set `storage_use_azuread = true` because shared keys are disabled. Create containers with `storage_account_id` so they go through the ARM management plane, and the runner never needs data-plane network access to a firewalled storage account.
 - `databricks/databricks ~> 1.137` (1.137.0 is the latest release on 2026-10-06; pin and let Dependabot bump it).
 - `hashicorp/random` for globally unique name suffixes.
 
@@ -311,7 +311,7 @@ These already exist in this repo, so the lab copies them: actions SHA-pinned, De
 
 ### Phase 3: Azure OpenAI / AI Foundry
 
-- **3a (core): summarization.** Deploy a Foundry (AI Services) resource in East US 2 with one small-model deployment, for example `gpt-4.1-mini` Global Standard (check model availability and retirement dates at build time). Set **explicit TPM capacity** in Terraform, which is the "quota management" talking point. Disable local (key) auth. A job task reads gold narratives, calls the model through the UC service credential, and writes summaries plus token counts to `dbxlab.gold.event_summaries`.
+- **3a (core): summarization.** Deploy a Foundry (AI Services) resource in East US 2 with one small-model deployment, for example `gpt-4.1-mini` Global Standard (check model availability and retirement dates at build time). Set **explicit TPM capacity** in Terraform, which is the "quota management" talking point. Disable local (key) auth. **Placement (amended 2026-10-10): the Foundry / Azure OpenAI account goes in `bootstrap` as a persistent resource (recommended), not in the ephemeral `platform` stack.** Deleted Foundry/AI Services resources are soft-deleted and their name can't be reused for 48 hours unless purged ([Microsoft Learn](https://learn.microsoft.com/en-us/azure/ai-services/recover-purge-resources)), which would break nightly destroy/redeploy. A pay-as-you-go account and Standard/Global Standard deployments have no standing cost, so keeping them persistent is free. The alternative is a random name suffix per deploy, at the cost of leaving soft-deleted accounts behind. The ephemeral access connector's role assignment on the persistent account is created by the apply identity, so its conditioned RBAC Administrator scope must then include that account. A job task reads gold narratives, calls the model through the UC service credential, and writes summaries plus token counts to `dbxlab.gold.event_summaries`.
 - **3b (optional): small RAG.** Embed narratives with `text-embedding-3-small`, index them in **AI Search**, and answer questions like "what drove hail losses in Texas last spring?" with citations to event IDs. Tier choice: **Free** costs $0 but has no private endpoint and no managed-identity indexers. **Basic** costs $0.101/hr (~$73.73/mo always on, about $0.51 per 4-hour session) and supports private endpoints. In ephemeral mode, Basic only exists during a session, so it's cheap. In always-on mode it would more than double the bill. A no-service alternative is to store embeddings in a Delta table and do cosine similarity in Python, which is fine at this size and costs nothing.
 - **3c (stretch): AI gateway.** Put API Management in front of the model with a token-limit policy. Developer tier is $0.0658/hr (~$48/mo); Basic v2 is $0.205/hr (~$150/mo). Ephemeral only. Confirm which tiers support the token-limit policy before choosing.
 
@@ -672,7 +672,7 @@ Steps marked **[Colin]** are hands-on steps Colin does himself on purpose, so he
 
 **Build**
 - 1a: **[Colin]** apply `bootstrap` locally (state account, identities, federated credentials, budgets).
-- 1a: **[Colin]** account console. Confirm or create the East US 2 metastore, and grant the apply identity metastore privileges.
+- 1a: **[Colin]** account console. Confirm or create the East US 2 metastore, **enable auto-assignment of new East US 2 workspaces (required)**, and grant the apply identity metastore privileges.
 - 1b: `platform` stack (network, NAT, private endpoints, DNS, ADLS, access connector, workspace).
 - 1c: workflows (ci/deploy/destroy, Checkov, environment gate).
 - 1d: `workspace` stack (storage credential, external location, catalog/schemas, grants, cluster policy).
@@ -683,7 +683,7 @@ Steps marked **[Colin]** are hands-on steps Colin does himself on purpose, so he
 - `destroy` returns the subscription to zero billable lab resources (bootstrap aside).
 - No secrets anywhere: Actions holds only variables, and shared-key auth is off on both storage accounts.
 - Cluster nodes have no public IPs (verified in the managed RG).
-- From a notebook, the storage FQDN resolves to a private IP, and the storage account rejects public access.
+- From a notebook, the storage FQDN resolves to a private IP, and the storage account rejects requests from anything other than the private endpoints and the access connector.
 - Checkov passes, or each skip has an inline justification.
 - Budgets exist for both RGs.
 - Deploy and destroy times measured and recorded in the README.
@@ -771,7 +771,7 @@ Steps marked **[Colin]** are hands-on steps Colin does himself on purpose, so he
 
 **Build**
 - **[Colin]** deploy a small model once by hand in the Foundry portal, and call it with `curl` plus an Entra token (`az account get-access-token --resource https://cognitiveservices.azure.com`). Then codify it.
-- Terraform: AI resource, deployment with TPM capacity, local auth disabled, role assignment for the access connector.
+- Terraform: AI resource **in `bootstrap` (persistent; avoids the 48-hour soft-delete name lock)**, deployment with TPM capacity, local auth disabled, role assignment for the access connector (extend the apply identity's conditioned RBAC Administrator scope to the AI resource).
 - UC service credential.
 - Summarization task.
 - Optional: RAG (3b) and APIM gateway (3c).

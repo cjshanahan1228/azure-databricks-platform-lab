@@ -80,13 +80,15 @@ it lives in this repo.
 
 ### 6. Private endpoints and private DNS (and the Private Link options)
 
-- The lakehouse account has **public network access disabled**. Clusters reach
-  it through **private endpoints** in `snet-pep`: NICs with private IPs for the
+- The lakehouse account is **firewalled to the access connector**: its public
+  endpoint denies everything by default (no IP or VNet rules, no "trusted
+  Azure services" exception) except one resource-instance rule for the lab's
+  access connector. Clusters reach it through **private endpoints** in `snet-pep`: NICs with private IPs for the
   `dfs` (ADLS / ABFS) and `blob` sub-resources.
 - **Private DNS zones** (`privatelink.dfs.core.windows.net`,
   `privatelink.blob.core.windows.net`) linked to the VNet make the *normal*
   storage hostname resolve to the private IP inside the VNet. Without the zone
-  link, the hostname resolves publicly and the connection is refused.
+  link, the hostname resolves publicly and the firewall refuses the connection.
 - Databricks itself has two more Private Link options I did **not** build:
   **back-end** (cluster → control plane over a private endpoint; a cheap
   optional toggle later) and **front-end** (the UI/API only reachable from a
@@ -122,9 +124,12 @@ it lives in this repo.
   identity** that Unity Catalog uses to reach storage. It gets **Storage Blob
   Data Contributor** on the lakehouse account. Users never see storage keys;
   UC hands clusters short-lived, path-scoped credentials.
-- It's also what lets UC (the control plane) reach a storage account with
-  public access disabled: the account has a **resource-instance rule** for this
-  connector.
+- It's also what lets UC (the control plane, which is *not* in my VNet) reach
+  the firewalled account: the account has a **resource-instance rule** for this
+  connector. That's why public network access is "enabled from selected
+  networks" rather than fully disabled; Databricks documents this as the
+  standard approach, and it keeps storage-credential validation and credential
+  vending working.
 - *Maps to:* a managed identity on a Function App plus a role assignment, as in
   the portfolio's status function.
 
@@ -200,12 +205,18 @@ written down.
 2. **Catalog** (left nav): is there a metastore in **eastus2**?
    - **Yes:** open it. Note its name and owner, and agree on naming if anyone
      else uses it (the lab only adds a `dbxlab` catalog, `dbxlab-*` credential
-     and location). If there's an option to **automatically assign new
-     workspaces** to it, turn it on. Otherwise you'll assign the lab workspace
-     by hand after each deploy (Step 4).
+     and location).
    - **No:** **Create metastore**, region `eastus2`, and leave the ADLS path
      empty (catalogs bring their own storage, as `dbxlab` does). Make yourself
      (or a group you're in) the **metastore admin**.
+   - **Either way (required): turn on auto-assignment.** Open the metastore →
+     **Configuration** → *Workspace assignment* → **Automatically assign new
+     workspaces in eastus2 to this metastore** → *Enable auto-assignment*.
+     This is a hard prerequisite, not an option: the workspace is brand new on
+     every deploy, and the CI identity is deliberately *not* an account admin,
+     so it can't assign a metastore itself. Deploy checks this right after the
+     workspace is created and fails with a pointer back here if it's missing.
+     ([Microsoft Learn: enable auto-assignment](https://learn.microsoft.com/en-us/azure/databricks/data-governance/unity-catalog/manage-metastore))
 3. **User management → Service principals → Add service principal →
    Microsoft Entra ID managed**: paste the apply identity's application ID and
    name it `id-gh-dbxlab-apply`. This puts the CI identity in the account so it
@@ -227,9 +238,14 @@ later, or reject.
 2. Open the **Plan (platform)** job summary and read it. This is the exact
    change set you're approving; the apply job refuses to run if it changes.
 3. **Review deployments → lab → Approve.**
-4. When it finishes, note the **platform apply** time in the job summary.
-5. If the workspace isn't auto-assigned to the metastore: account console →
-   Catalog → your metastore → Workspaces → assign `dbw-dbxlab-eus2`.
+4. When it finishes, note the **platform apply** time. It's in the job
+   summary and also shown as a "Deploy timings" annotation on the run page.
+   Write it in the Notes section below and the README table. It also goes on
+   the colinshanahan.dev lab page stub (portfolio#61).
+5. The **Check metastore assignment** step must pass. If it fails, auto-assignment
+   isn't on: fix it (Step 2), then re-run the workflow. A one-off manual
+   assignment in the account console would also unblock *this* deploy, but
+   the next deploy creates a new workspace and would fail again.
 
 `DEPLOY_WORKSPACE_STACK` isn't set yet, so Unity Catalog objects aren't
 created. That's deliberate: you build them by hand first (Step 6).
@@ -297,7 +313,8 @@ This is design phase 1's "do it by hand before the Terraform".
      SHOW GRANTS ON TABLE colin_scratch.demo.t;
      ```
    - Find the table's files in the storage account's container (you'll be
-     refused from the portal, because public access is off). That's the point.
+     refused from the portal, because the firewall only admits the access
+     connector and the private endpoints). That's the point.
 6. **Clean up the scratch objects** (important: external locations can't
    overlap, and the Terraform location covers the whole container):
    ```sql

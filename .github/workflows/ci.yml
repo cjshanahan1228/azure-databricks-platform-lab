@@ -106,9 +106,16 @@ jobs:
 
       - name: Checkov
         id: checkov
+        # Checkov's workflow schema doesn't know GitHub's `concurrency.queue`
+        # key yet and silently SKIPS files that use it, so scan a copy of the
+        # workflows with only that line removed (nothing else changes).
         run: |
           set +e
-          checkov --directory . --framework terraform github_actions \
+          mkdir -p .checkov-gha/.github/workflows
+          for f in .github/workflows/*.yml; do
+            sed '/^ *queue: max$/d' "$f" > ".checkov-gha/$f"
+          done
+          checkov --directory infra --directory .checkov-gha --framework terraform github_actions \
             --output cli --output sarif --output-file-path console,results.sarif \
             --compact --quiet
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"

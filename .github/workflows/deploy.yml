@@ -34,11 +34,10 @@ on:
 permissions:
   contents: read
 
-# One environment, one operation at a time, shared with destroy.yml. Never
-# cancel an in-flight apply.
-concurrency:
-  group: lab-env
-  cancel-in-progress: false
+# No workflow-level concurrency: the lock is on the APPLY job only (below), so
+# a deploy that is merely planned or waiting for approval doesn't hold the
+# `lab-env` group. destroy.yml also cancels any deploy run that is waiting for
+# approval or queued before it destroys (see docs/runbooks/deploy-destroy-concurrency.md).
 
 env:
   TF_IN_AUTOMATION: "true"
@@ -106,6 +105,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: lab
+    # Shared with destroy.yml. Never cancel an in-flight apply; `queue: max`
+    # stops a newer queued run from replacing (cancelling) an older pending one,
+    # e.g. a pending nightly destroy (GitHub's default keeps only one pending).
+    concurrency:
+      group: lab-env
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write # OIDC -> id-gh-dbxlab-apply
@@ -133,6 +139,14 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
+      # Azure CLI session for the pre/post checks below (Terraform itself uses
+      # ARM_USE_OIDC directly).
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_APPLY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
       - name: terraform init (platform)
         run: |
           terraform -chdir=infra/platform init -lockfile=readonly -no-color \
@@ -150,12 +164,23 @@ jobs:
           fi
           echo "Change set matches the approved plan (${digest:0:16})."
 
+      - name: Wait for the previous managed RG to finish deleting
+        env:
+          WAIT_MINUTES: "30"
+        run: .github/scripts/wait-managed-rg.sh
+
       - name: terraform apply (platform)
         run: |
           t0=$(date +%s)
           terraform -chdir=infra/platform apply -lock-timeout=5m -no-color tfplan > apply.log 2>&1 || { tail -n 60 apply.log; exit 1; }
           grep -E '^Apply complete' apply.log || true
           echo "platform_seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+
+      # Phase 1 acceptance check: the brand-new workspace must be attached to
+      # the East US 2 metastore via auto-assignment (the apply identity isn't
+      # an account admin and can't assign it).
+      - name: Check metastore assignment
+        run: .github/scripts/databricks-checks.sh metastore
 
       - name: Workspace stack
         id: ws
@@ -175,6 +200,7 @@ jobs:
             -backend-config="resource_group_name=rg-dbxlab-state" \
             -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
             -backend-config="container_name=tfstate"
+          .github/scripts/databricks-checks.sh orphan-catalog
           terraform -chdir=infra/workspace plan -lock-timeout=5m -no-color -out=tfplan > /dev/null
           .github/scripts/plan-summary.sh infra/workspace tfplan "Terraform plan: workspace (applied in this run)" > /dev/null
           terraform -chdir=infra/workspace apply -lock-timeout=5m -no-color tfplan > apply.log 2>&1 || { tail -n 60 apply.log; exit 1; }
@@ -199,3 +225,6 @@ jobs:
             echo
             echo "**Remember:** this costs money while it's up. destroy.yml runs nightly unless LAB_KEEP_ALIVE_UNTIL is set."
           } >> "$GITHUB_STEP_SUMMARY"
+          # Also as an annotation, so the times show on the run page without
+          # opening the summary. Durations only; nothing identifying.
+          echo "::notice title=Deploy timings::platform apply $(fmt "${platform_seconds:-}"), workspace apply $(fmt "${workspace_seconds:-}"), job $(fmt "$(( $(date +%s) - started ))")"
